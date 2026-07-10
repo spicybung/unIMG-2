@@ -2,9 +2,7 @@
 
 `unimg.exe` rebuilds WRLD/xet files and recovers exact resource payloads from companion IMG archives used by **Grand Theft Auto: Liberty City Stories** and **Grand Theft Auto: Vice City Stories**.
 
-The program does not use nearest-resource matching, name aliases, forced cloning, or other approximate fallback logic.
-
-## Basic use
+## How to use
 
 Place the matching `.lvz` and `.img` files together, then drag the `.lvz` onto `unimg.exe`, or run:
 
@@ -29,8 +27,6 @@ unimg indust.lvz --game lcs
 unimg beach.lvz --game vcs
 ```
 
-The parser distinguishes the LCS 8-byte and VCS 12-byte resource row layouts and also uses the sector-row directory count when available.
-
 ## Exact resource recovery
 
 To focus recovery on known missing resource IDs:
@@ -47,7 +43,7 @@ To test all supported pointer forms for every resource row:
 unimg beach.lvz --all-pointer-variants
 ```
 
-This can generate duplicate candidates, so targeted recovery is the safer default.
+This can generate duplicates, so targeted recovery is the safer default.
 
 ## Options
 
