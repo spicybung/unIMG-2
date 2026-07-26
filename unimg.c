@@ -8,15 +8,8 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU General Public License for more details.
 //
-// Stories LVZ+IMG unpacker for Liberty City Stories and Vice City Stories.
-//
-// Goals:
-//   - Rebuild DLRW/xet continuation files using LVZ header + IMG data.
-//   - Parse master Resource[] with automatic 8-byte / 12-byte row detection.
-//   - Parse sector/slave IMG Resource[] tables with LCS and VCS layouts.
-//   - Resolve exact resource ids from IMG-side tables, including LVZ-empty
-//     resources whose payload actually continues in the companion IMG.
-//   - Avoid nearest-neighbor, alias, or fake fallback extraction.
+// Unpacks Liberty City Stories and Vice City Stories LVZ+IMG pairs.
+// Rebuilds continuation files and extracts IMG-side resources by their real ids.
 
 #define _CRT_SECURE_NO_WARNINGS
 #ifndef _WIN32
@@ -32,6 +25,7 @@
 #include <time.h>
 #include <errno.h>
 #include <ctype.h>
+#include <limits.h>
 
 #ifdef _WIN32
   #include <windows.h>
@@ -77,7 +71,7 @@ typedef struct {
     GameMode game;
     int write_continuations;
     int write_resources;
-    int all_pointer_variants;
+    int all_pointer_forms;
     IdSet wanted_ids;
 } Options;
 
@@ -159,7 +153,7 @@ typedef struct {
     uint32_t raw_ptr;
     uint32_t raw_off;
     uint32_t resource_end;
-    int targeted_variant;
+    int alternate_pointer;
 } ResourceRecord;
 
 typedef struct {
@@ -206,6 +200,12 @@ static uint32_t read_u32le(const uint8_t* b, size_t off) {
         | ((uint32_t)b[off + 1] << 8)
         | ((uint32_t)b[off + 2] << 16)
         | ((uint32_t)b[off + 3] << 24);
+}
+
+static int add_u32(uint32_t a, uint32_t b, uint32_t* out) {
+    if (a > UINT32_MAX - b) return 0;
+    *out = a + b;
+    return 1;
 }
 
 static int file_exists(const char* path) {
@@ -388,22 +388,30 @@ static void parse_wanted_ids(IdSet* set, const char* text) {
     strcpy(copy, text);
     char* p = copy;
     set->enabled = 1;
+
     while (*p) {
         while (*p == ',' || *p == ';' || isspace((unsigned char)*p)) ++p;
         if (!*p) break;
+
         char* end = p;
         while (*end && *end != ',' && *end != ';' && !isspace((unsigned char)*end)) ++end;
-        char old = *end;
+        char saved = *end;
         *end = 0;
+
+        errno = 0;
         char* parse_end = NULL;
         long id = strtol(p, &parse_end, 0);
-        if (parse_end && *parse_end == 0 && id >= 0 && id <= 0x7FFFFFFF) {
-            idset_add(set, (int)id);
+        if (errno == ERANGE || parse_end == p || *parse_end != 0 || id < 0 || id > INT_MAX) {
+            die("Bad resource id in --wanted: %s", p);
         }
-        *end = old;
+        idset_add(set, (int)id);
+
+        *end = saved;
         p = end;
     }
+
     free(copy);
+    if (set->count == 0) die("--wanted needs at least one resource id");
 }
 
 static int idset_contains(const IdSet* set, int id) {
@@ -414,7 +422,7 @@ static int idset_contains(const IdSet* set, int id) {
     return 0;
 }
 
-static int is_wanted_target(const IdSet* set, int id) {
+static int is_requested_id(const IdSet* set, int id) {
     if (!set->enabled) return 0;
     return idset_contains(set, id);
 }
@@ -491,7 +499,7 @@ static void tag_to_string(const uint8_t* d, size_t off, char out[5]) {
     }
 }
 
-static int plausible_continuation_header(const uint8_t* d, size_t n, size_t off, u64 img_size) {
+static int valid_continuation_header(const uint8_t* d, size_t n, size_t off, u64 img_size) {
     if (!is_known_preface_tag(d, n, off)) return 0;
     if (off + 0x20 > n) return 0;
     uint32_t total = read_u32le(d, off + 0x08);
@@ -504,7 +512,7 @@ static int plausible_continuation_header(const uint8_t* d, size_t n, size_t off,
 static void scan_continuation_headers(const uint8_t* d, size_t n, u64 img_size, HeaderList* out) {
     memset(out, 0, sizeof(*out));
     for (size_t off = 0; off + 0x20 <= n; off += 4) {
-        if (!plausible_continuation_header(d, n, off, img_size)) continue;
+        if (!valid_continuation_header(d, n, off, img_size)) continue;
         ContinuationHeader h;
         memset(&h, 0, sizeof(h));
         h.lvz_off = (uint32_t)off;
@@ -519,7 +527,9 @@ static void scan_continuation_headers(const uint8_t* d, size_t n, u64 img_size, 
         header_list_push(out, h);
     }
 
-    qsort(out->items, out->count, sizeof(ContinuationHeader), compare_headers_by_lvz_off);
+    if (out->count > 1) {
+        qsort(out->items, out->count, sizeof(ContinuationHeader), compare_headers_by_lvz_off);
+    }
     size_t w = 0;
     for (size_t r = 0; r < out->count; ++r) {
         if (w == 0 || out->items[r].lvz_off != out->items[w - 1].lvz_off) {
@@ -530,13 +540,17 @@ static void scan_continuation_headers(const uint8_t* d, size_t n, u64 img_size, 
 }
 
 static int try_inflate(const uint8_t* in, size_t in_len, int window_bits, uint8_t** out_data, size_t* out_len) {
+    if (in_len > UINT_MAX) return -4;
+
     z_stream strm;
     memset(&strm, 0, sizeof(strm));
     int ret = inflateInit2(&strm, window_bits);
     if (ret != Z_OK) return -1;
 
-    size_t cap = in_len * 3 + 4096;
-    if (cap < 8192) cap = 8192;
+    size_t cap;
+    if (in_len > (STORIES_MAX_DECOMPRESSED_BYTES - 4096u) / 3u) cap = STORIES_MAX_DECOMPRESSED_BYTES;
+    else cap = in_len * 3u + 4096u;
+    if (cap < 8192u) cap = 8192u;
     if (cap > STORIES_MAX_DECOMPRESSED_BYTES) cap = STORIES_MAX_DECOMPRESSED_BYTES;
     uint8_t* out = (uint8_t*)xmalloc(cap);
     size_t total = 0;
@@ -551,7 +565,9 @@ static int try_inflate(const uint8_t* in, size_t in_len, int window_bits, uint8_
                 free(out);
                 return -3;
             }
-            size_t next_cap = cap * 2 + 8192;
+            size_t next_cap;
+            if (cap > (STORIES_MAX_DECOMPRESSED_BYTES - 8192u) / 2u) next_cap = STORIES_MAX_DECOMPRESSED_BYTES;
+            else next_cap = cap * 2u + 8192u;
             if (next_cap > STORIES_MAX_DECOMPRESSED_BYTES) next_cap = STORIES_MAX_DECOMPRESSED_BYTES;
             out = (uint8_t*)xrealloc(out, next_cap);
             cap = next_cap;
@@ -620,26 +636,39 @@ static u64 file_size_of_open(FILE* f) {
     return (u64)v;
 }
 
-static u64 copy_file_slice(FILE* in, u64 start, u64 end, FILE* out) {
+static int copy_file_slice(FILE* in, u64 start, u64 end, FILE* out, u64* copied_out) {
     const size_t chunk_size = 1u << 20;
     uint8_t* buf = (uint8_t*)xmalloc(chunk_size);
     u64 left = end > start ? end - start : 0;
+    u64 total = 0;
+
     if (fseek64(in, (long long)start, SEEK_SET) != 0) {
         free(buf);
         return 0;
     }
-    u64 total = 0;
+
     while (left) {
         size_t want = left > chunk_size ? chunk_size : (size_t)left;
         size_t got = fread(buf, 1, want, in);
-        if (!got) break;
-        fwrite(buf, 1, got, out);
+        if (got == 0) {
+            free(buf);
+            return 0;
+        }
+        if (fwrite(buf, 1, got, out) != got) {
+            free(buf);
+            return 0;
+        }
         total += got;
         left -= got;
-        if (got < want) break;
+        if (got != want) {
+            free(buf);
+            return 0;
+        }
     }
+
     free(buf);
-    return total;
+    *copied_out = total;
+    return 1;
 }
 
 static int write_binary_file(const char* path, const uint8_t* data, size_t len) {
@@ -649,7 +678,7 @@ static int write_binary_file(const char* path, const uint8_t* data, size_t len) 
         fclose(f);
         return 0;
     }
-    fclose(f);
+    if (fclose(f) != 0) return 0;
     return 1;
 }
 
@@ -704,13 +733,13 @@ static int get_pass_count_for_game(int game) {
     return game == GAME_LCS ? 8 : 9;
 }
 
-static int score_resource_entry_stride(const uint8_t* lvz, size_t n, uint32_t base, uint32_t res_count, int stride, uint32_t table_limit) {
+static int rate_resource_entry_stride(const uint8_t* lvz, size_t n, uint32_t base, uint32_t res_count, int stride, uint32_t table_limit) {
     if (!(stride == 8 || stride == 12)) return -1000000;
     if (base == 0 || base >= n || res_count == 0) return -1000000;
     if ((u64)base + (u64)res_count * (u64)stride > (u64)table_limit) return -1000000;
 
     uint32_t sample_count = res_count < 1024 ? res_count : 1024;
-    int score = 0;
+    int rating = 0;
     int invalid = 0;
     int supported = 0;
     int id_like = 0;
@@ -726,33 +755,33 @@ static int score_resource_entry_stride(const uint8_t* lvz, size_t n, uint32_t ba
             else id_like -= 4;
         }
 
-        if (aux_ptr == 0 || (aux_ptr >= 0x40 && aux_ptr < n && (aux_ptr & 3) == 0)) score += 1;
-        else score -= 1;
+        if (aux_ptr == 0 || (aux_ptr >= 0x40 && aux_ptr < n && (aux_ptr & 3) == 0)) rating += 1;
+        else rating -= 1;
 
         if (raw_ptr == 0 || raw_ptr == 0xFFFFFFFFu) {
-            score += 1;
+            rating += 1;
             continue;
         }
 
         if (!(raw_ptr >= 0x40 && raw_ptr + 4 <= n && (raw_ptr & 3) == 0)) {
             invalid++;
-            score -= 8;
+            rating -= 8;
             continue;
         }
 
-        score += 2;
+        rating += 2;
         if (is_known_preface_tag(lvz, n, raw_ptr)) {
             supported++;
-            score += 8;
+            rating += 8;
         } else {
-            score += 1;
+            rating += 1;
         }
     }
 
-    if (stride == 12) score += id_like;
-    score += supported;
-    score -= invalid * 2;
-    return score;
+    if (stride == 12) rating += id_like;
+    rating += supported;
+    rating -= invalid * 2;
+    return rating;
 }
 
 static int detect_master_resource_stride(const uint8_t* lvz, size_t n, uint32_t base, uint32_t res_count, uint32_t first_group_addr) {
@@ -763,18 +792,18 @@ static int detect_master_resource_stride(const uint8_t* lvz, size_t n, uint32_t 
     uint32_t space = table_limit - base;
 
     int best_stride = 8;
-    int best_score = -1000000;
+    int best_rating = -1000000;
     if (space >= res_count * 12u) {
-        int score = score_resource_entry_stride(lvz, n, base, res_count, 12, table_limit);
-        if (score > best_score) {
-            best_score = score;
+        int rating = rate_resource_entry_stride(lvz, n, base, res_count, 12, table_limit);
+        if (rating > best_rating) {
+            best_rating = rating;
             best_stride = 12;
         }
     }
     if (space >= res_count * 8u) {
-        int score = score_resource_entry_stride(lvz, n, base, res_count, 8, table_limit);
-        if (score > best_score) {
-            best_score = score;
+        int rating = rate_resource_entry_stride(lvz, n, base, res_count, 8, table_limit);
+        if (rating > best_rating) {
+            best_rating = rating;
             best_stride = 8;
         }
     }
@@ -866,7 +895,7 @@ static void classify_resource_kind(const uint8_t* data, size_t n, uint32_t off, 
     }
 }
 
-static void add_resource_candidate(
+static void add_resource_record(
     ResourceRecordList* records,
     const uint8_t* img,
     size_t img_size,
@@ -875,25 +904,24 @@ static void add_resource_candidate(
     int resource_index,
     int res_id,
     uint32_t raw_ptr,
-    uint32_t candidate_off,
+    uint32_t resource_off,
     uint32_t row_off,
     int stride,
     const char* layout,
     const char* pointer_form,
-    int targeted_variant,
+    int alternate_pointer,
     uint32_t expanded_end
 ) {
     if (res_id < 0) return;
     if (!idset_contains(&options->wanted_ids, res_id)) return;
 
-    int targeted = is_wanted_target(&options->wanted_ids, res_id);
-    if (targeted_variant && !targeted && !options->all_pointer_variants) return;
+    int requested = is_requested_id(&options->wanted_ids, res_id);
+    if (alternate_pointer && !requested && !options->all_pointer_forms) return;
 
-    if ((candidate_off & 3u) != 0) return;
-    if ((u64)candidate_off + 4ull > (u64)img_size) return;
+    if ((resource_off & 3u) != 0) return;
+    if ((u64)resource_off + 4ull > (u64)img_size) return;
 
-    if (!targeted_variant && !(sector->cont <= candidate_off && candidate_off < expanded_end)) return;
-    if (targeted_variant && !targeted && !options->all_pointer_variants) return;
+    if (!alternate_pointer && !(sector->cont <= resource_off && resource_off < expanded_end)) return;
 
     ResourceRecord rec;
     memset(&rec, 0, sizeof(rec));
@@ -909,14 +937,14 @@ static void add_resource_candidate(
     rec.sector_end = expanded_end;
     rec.row_off = row_off;
     rec.raw_ptr = raw_ptr;
-    rec.raw_off = candidate_off;
+    rec.raw_off = resource_off;
     rec.resource_end = expanded_end;
-    rec.targeted_variant = targeted_variant;
-    classify_resource_kind(img, img_size, candidate_off, expanded_end, rec.kind);
+    rec.alternate_pointer = alternate_pointer;
+    classify_resource_kind(img, img_size, resource_off, expanded_end, rec.kind);
     resource_record_list_push(records, rec);
 }
 
-static void add_sector_resource_with_variants(
+static void add_sector_resource_pointer_forms(
     ResourceRecordList* records,
     const uint8_t* img,
     size_t img_size,
@@ -931,18 +959,21 @@ static void add_sector_resource_with_variants(
     const char* layout,
     uint32_t expanded_end
 ) {
-    add_resource_candidate(records, img, img_size, options, sector, resource_index, res_id, raw_ptr, default_off, row_off, stride, layout, "default", 0, expanded_end);
+    add_resource_record(records, img, img_size, options, sector, resource_index, res_id, raw_ptr, default_off, row_off, stride, layout, "default", 0, expanded_end);
 
-    int targeted = is_wanted_target(&options->wanted_ids, res_id);
-    if (!targeted && !options->all_pointer_variants) return;
+    int requested = is_requested_id(&options->wanted_ids, res_id);
+    if (!requested && !options->all_pointer_forms) return;
 
-    if (raw_ptr >= 0x20u) {
-        add_resource_candidate(records, img, img_size, options, sector, resource_index, res_id, raw_ptr, sector->cont + raw_ptr - 0x20u, row_off, stride, layout, "cont_plus_ptr_minus_20", 1, expanded_end);
+    uint32_t offset;
+    if (raw_ptr >= 0x20u && add_u32(sector->cont, raw_ptr - 0x20u, &offset)) {
+        add_resource_record(records, img, img_size, options, sector, resource_index, res_id, raw_ptr, offset, row_off, stride, layout, "cont_plus_ptr_minus_20", 1, expanded_end);
     }
-    add_resource_candidate(records, img, img_size, options, sector, resource_index, res_id, raw_ptr, sector->cont + raw_ptr, row_off, stride, layout, "cont_plus_ptr", 1, expanded_end);
-    add_resource_candidate(records, img, img_size, options, sector, resource_index, res_id, raw_ptr, raw_ptr, row_off, stride, layout, "absolute_ptr", 1, expanded_end);
+    if (add_u32(sector->cont, raw_ptr, &offset)) {
+        add_resource_record(records, img, img_size, options, sector, resource_index, res_id, raw_ptr, offset, row_off, stride, layout, "cont_plus_ptr", 1, expanded_end);
+    }
+    add_resource_record(records, img, img_size, options, sector, resource_index, res_id, raw_ptr, raw_ptr, row_off, stride, layout, "absolute_ptr", 1, expanded_end);
     if (raw_ptr >= 0x20u) {
-        add_resource_candidate(records, img, img_size, options, sector, resource_index, res_id, raw_ptr, raw_ptr - 0x20u, row_off, stride, layout, "absolute_ptr_minus_20", 1, expanded_end);
+        add_resource_record(records, img, img_size, options, sector, resource_index, res_id, raw_ptr, raw_ptr - 0x20u, row_off, stride, layout, "absolute_ptr_minus_20", 1, expanded_end);
     }
 }
 
@@ -979,8 +1010,9 @@ static void collect_sector_resources(
         uint32_t num_resources = read_u16le(img, cont + 0x04);
         if (num_resources == 0 || num_resources > STORIES_MAX_SECTOR_RESOURCES) continue;
         if (resources_ptr < 0x20u) continue;
-        uint32_t list_start = cont + resources_ptr - 0x20u;
-        if (list_start < cont || list_start + 8u > end || list_start + 8u > img_size) continue;
+        uint32_t list_start;
+        if (!add_u32(cont, resources_ptr - 0x20u, &list_start)) continue;
+        if (list_start < cont || (u64)list_start + 8ull > end || (u64)list_start + 8ull > img_size) continue;
 
         if ((u64)list_start + (u64)num_resources * 8ull <= end) {
             for (uint32_t ri = 0; ri < num_resources; ++ri) {
@@ -988,8 +1020,9 @@ static void collect_sector_resources(
                 int res_id = (int)read_i32le(img, row_off + 0x00);
                 uint32_t raw_ptr = read_u32le(img, row_off + 0x04);
                 if (raw_ptr < 0x20u) continue;
-                uint32_t raw_off = cont + raw_ptr - 0x20u;
-                add_sector_resource_with_variants(records, img, img_size, options, sector, (int)ri, res_id, raw_ptr, raw_off, row_off, 8, "id_ptr", end);
+                uint32_t raw_off;
+                if (!add_u32(cont, raw_ptr - 0x20u, &raw_off)) continue;
+                add_sector_resource_pointer_forms(records, img, img_size, options, sector, (int)ri, res_id, raw_ptr, raw_off, row_off, 8, "id_ptr", end);
             }
         }
 
@@ -1000,27 +1033,30 @@ static void collect_sector_resources(
                 uint32_t b = read_u32le(img, row_off + 0x04);
                 uint32_t c = read_u32le(img, row_off + 0x08);
 
-                if (a >= 0x20u) {
-                    add_sector_resource_with_variants(records, img, img_size, options, sector, (int)ri, (int)c, a, cont + a - 0x20u, row_off, 12, "ptr_unused_id", end);
+                uint32_t row_resource_off;
+                if (a >= 0x20u && add_u32(cont, a - 0x20u, &row_resource_off)) {
+                    add_sector_resource_pointer_forms(records, img, img_size, options, sector, (int)ri, (int)c, a, row_resource_off, row_off, 12, "ptr_unused_id", end);
                 }
 
-                int allow_alt = options->all_pointer_variants || is_wanted_target(&options->wanted_ids, (int)a) || is_wanted_target(&options->wanted_ids, (int)b) || is_wanted_target(&options->wanted_ids, (int)c);
+                int allow_alt = options->all_pointer_forms || is_requested_id(&options->wanted_ids, (int)a) || is_requested_id(&options->wanted_ids, (int)b) || is_requested_id(&options->wanted_ids, (int)c);
                 if (allow_alt) {
-                    if (a >= 0x20u) {
-                        add_sector_resource_with_variants(records, img, img_size, options, sector, (int)ri, (int)b, a, cont + a - 0x20u, row_off, 12, "ptr_id_unused", end);
+                    if (a >= 0x20u && add_u32(cont, a - 0x20u, &row_resource_off)) {
+                        add_sector_resource_pointer_forms(records, img, img_size, options, sector, (int)ri, (int)b, a, row_resource_off, row_off, 12, "ptr_id_unused", end);
                     }
-                    if (c >= 0x20u) {
-                        add_sector_resource_with_variants(records, img, img_size, options, sector, (int)ri, (int)a, c, cont + c - 0x20u, row_off, 12, "id_unused_ptr", end);
+                    if (c >= 0x20u && add_u32(cont, c - 0x20u, &row_resource_off)) {
+                        add_sector_resource_pointer_forms(records, img, img_size, options, sector, (int)ri, (int)a, c, row_resource_off, row_off, 12, "id_unused_ptr", end);
                     }
-                    if (b >= 0x20u) {
-                        add_sector_resource_with_variants(records, img, img_size, options, sector, (int)ri, (int)a, b, cont + b - 0x20u, row_off, 12, "id_ptr_unused", end);
+                    if (b >= 0x20u && add_u32(cont, b - 0x20u, &row_resource_off)) {
+                        add_sector_resource_pointer_forms(records, img, img_size, options, sector, (int)ri, (int)a, b, row_resource_off, row_off, 12, "id_ptr_unused", end);
                     }
                 }
             }
         }
     }
 
-    qsort(records->items, records->count, sizeof(ResourceRecord), compare_resources_by_cont_off);
+    if (records->count > 1) {
+        qsort(records->items, records->count, sizeof(ResourceRecord), compare_resources_by_cont_off);
+    }
 
     size_t w = 0;
     for (size_t r = 0; r < records->count; ++r) {
@@ -1042,6 +1078,8 @@ static void collect_sector_resources(
         uint32_t resource_end = records->items[i].sector_end;
         for (size_t j = i + 1; j < records->count; ++j) {
             if (records->items[j].cont != records->items[i].cont) break;
+            if (strcmp(records->items[j].layout, records->items[i].layout) != 0) continue;
+            if (strcmp(records->items[j].pointer_form, records->items[i].pointer_form) != 0) continue;
             if (records->items[j].raw_off > records->items[i].raw_off) {
                 resource_end = records->items[j].raw_off;
                 break;
@@ -1075,34 +1113,45 @@ static int write_continuation_file(
     FILE* log
 ) {
     if ((u64)h->lvz_off + 0x20ull > (u64)lvz_size) return 0;
+
+    u64 start = h->continuation;
+    u64 need = h->total_size >= 0x20u ? (u64)h->total_size - 0x20ull : 0;
+    if (start > img_size || need > img_size - start) {
+        fprintf(log, "[skip] bad continuation range: lvz=0x%08X cont=0x%08X size=0x%08X img=0x%llX\n",
+            h->lvz_off, h->continuation, h->total_size, (unsigned long long)img_size);
+        return 0;
+    }
+    u64 end = start + need;
+
     FILE* out = fopen(out_path, "wb");
     if (!out) {
         fprintf(log, "[error] cannot write %s (%s)\n", out_path, strerror(errno));
         return 0;
     }
-    fwrite(lvz + h->lvz_off, 1, 0x20, out);
-    u64 start = h->continuation;
-    u64 need = h->total_size >= 0x20u ? (u64)h->total_size - 0x20ull : 0;
-    u64 end = start + need;
-    if (start > img_size) {
-        fprintf(log, "[warn] continuation starts beyond IMG: lvz=0x%08X cont=0x%08X size=0x%08X\n", h->lvz_off, h->continuation, h->total_size);
+
+    if (fwrite(lvz + h->lvz_off, 1, 0x20, out) != 0x20) {
+        fprintf(log, "[error] failed to write header: %s\n", out_path);
         fclose(out);
-        return 1;
+        remove(out_path);
+        return 0;
     }
-    if (end > img_size) {
-        fprintf(log, "[warn] continuation clipped: lvz=0x%08X end=0x%llX img=0x%llX\n", h->lvz_off, (unsigned long long)end, (unsigned long long)img_size);
-        end = img_size;
+
+    u64 copied = 0;
+    if (!copy_file_slice(img_file, start, end, out, &copied)) {
+        fprintf(log, "[error] failed to copy continuation data: %s\n", out_path);
+        fclose(out);
+        remove(out_path);
+        return 0;
     }
-    u64 copied = copy_file_slice(img_file, start, end, out);
-    fclose(out);
-    fprintf(log, "[continuation] %s lvz=0x%08X tag=%s cont=0x%08X body=0x%llX total_out=0x%llX expected=0x%08X\n",
-        out_path,
-        h->lvz_off,
-        h->tag,
-        h->continuation,
-        (unsigned long long)copied,
-        (unsigned long long)(copied + 0x20ull),
-        h->total_size);
+    if (fclose(out) != 0) {
+        fprintf(log, "[error] failed to finish %s\n", out_path);
+        remove(out_path);
+        return 0;
+    }
+
+    fprintf(log, "[continuation] %s lvz=0x%08X tag=%s cont=0x%08X body=0x%llX total=0x%llX\n",
+        out_path, h->lvz_off, h->tag, h->continuation,
+        (unsigned long long)copied, (unsigned long long)(copied + 0x20ull));
     return 1;
 }
 
@@ -1219,7 +1268,7 @@ static void write_sector_resources_csv(const ResourceRecordList* resources, cons
         fprintf(log, "[error] cannot write %s\n", path);
         return;
     }
-    fprintf(csv, "source,res_id,resource_index,sector_index,row_index,stride,layout,pointer_form,kind,cont,sector_end,row_off,raw_ptr,raw_off,resource_end,size,targeted_variant\n");
+    fprintf(csv, "source,res_id,resource_index,sector_index,row_index,stride,layout,pointer_form,kind,cont,sector_end,row_off,raw_ptr,raw_off,resource_end,size,alternate_pointer\n");
     for (size_t i = 0; i < resources->count; ++i) {
         const ResourceRecord* r = &resources->items[i];
         uint32_t size = r->resource_end > r->raw_off ? r->resource_end - r->raw_off : 0;
@@ -1240,7 +1289,7 @@ static void write_sector_resources_csv(const ResourceRecordList* resources, cons
             r->raw_off,
             r->resource_end,
             size,
-            r->targeted_variant);
+            r->alternate_pointer);
     }
     fclose(csv);
     fprintf(log, "[csv] %s\n", path);
@@ -1348,7 +1397,7 @@ static void write_summary_txt(
         for (size_t i = 0; i < options->wanted_ids.count; ++i) fprintf(f, " %d", options->wanted_ids.ids[i]);
         fprintf(f, "\n");
     }
-    fprintf(f, "Pointer variants: %s\n", options->all_pointer_variants ? "all" : "targeted-only");
+    fprintf(f, "Pointer forms: %s\n", options->all_pointer_forms ? "all" : "requested ids only");
     fclose(f);
 }
 
@@ -1362,9 +1411,9 @@ static void print_usage(void) {
         "Options:\n"
         "  --img <file.img>            Use an explicit companion IMG path.\n"
         "  --out <folder>              Use an explicit output folder.\n"
-        "  --game auto|lcs|vcs         Select row layout. Default: auto.\n"
-        "  --wanted <ids>              Extract/report only these resource ids, comma separated.\n"
-        "  --all-pointer-variants      Try all pointer interpretations globally. Default is targeted-only.\n"
+        "  --game auto|lcs|vcs         Set the game layout. Default: auto.\n"
+        "  --wanted <ids>              Only write and list these resource ids, comma separated.\n"
+        "  --all-pointer-variants      Check every supported pointer form for every resource id.\n"
         "  --no-continuations          Do not rebuild DLRW/xet continuation files.\n"
         "  --no-resources              Do not write IMG resource payload files. CSVs are still written.\n"
         "  --resources-only            Skip continuation files, keep resource payload output.\n"
@@ -1397,7 +1446,7 @@ static Options parse_options(int argc, char** argv) {
             if (i + 1 >= argc) die("--wanted needs a comma-separated id list");
             parse_wanted_ids(&options.wanted_ids, argv[++i]);
         } else if (strcmp(arg, "--all-pointer-variants") == 0) {
-            options.all_pointer_variants = 1;
+            options.all_pointer_forms = 1;
         } else if (strcmp(arg, "--no-continuations") == 0) {
             options.write_continuations = 0;
         } else if (strcmp(arg, "--no-resources") == 0) {
@@ -1450,8 +1499,11 @@ int main(int argc, char** argv) {
     maybe_decompress_lvz(lvz_raw, lvz_raw_len, &lvz, &lvz_len, &decompressed);
     free(lvz_raw);
 
+    if (lvz_len > UINT32_MAX) die("LVZ is larger than the 32-bit format can address: %s", options.lvz_path);
+
     size_t img_len = 0;
     uint8_t* img_bytes = read_entire_file(img_path, &img_len);
+    if (img_len > UINT32_MAX) die("IMG is larger than the 32-bit format can address: %s", img_path);
 
     FILE* img_file = fopen(img_path, "rb");
     if (!img_file) die("Cannot open IMG: %s", img_path);
