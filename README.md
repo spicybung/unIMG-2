@@ -1,6 +1,6 @@
 # unIMG 2
 
-`unimg.exe` rebuilds WRLD/xet files and recovers exact resource payloads from companion IMG archives used by **Grand Theft Auto: Liberty City Stories** and **Grand Theft Auto: Vice City Stories**.
+`unimg.exe` rebuilds WRLD/tex files and recovers exact resource payloads from companion IMG archives used by **Grand Theft Auto: Liberty City Stories** and **Grand Theft Auto: Vice City Stories**.
 
 ## How to use
 
